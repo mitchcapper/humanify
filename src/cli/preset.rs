@@ -12,8 +12,10 @@ use crate::llm::{
     ToolCallAndPrompt,
 };
 use crate::pipe;
+use crate::rename::sentinel;
 use crate::rename::{
     rename_all_identifiers_with_options, RenameError, RenameObserver, RenameOptions, Renamer,
+    SelectionPolicy, SentinelReport, SentinelSpec,
 };
 
 const DEFAULT_CONTEXT_SIZE: usize = 500;
@@ -73,6 +75,18 @@ pub struct PresetArgs {
     pub max_run_seconds: Option<u64>,
     pub max_tokens: Option<u32>,
     pub extra_body: Option<String>,
+    /// Literal source fragment (or `@file`) marking the start of the region to
+    /// rename.
+    pub start_sentinel: Option<String>,
+    /// Literal source fragment (or `@file`) marking the end of that region.
+    pub stop_sentinel: Option<String>,
+    /// Policy A: only symbols *declared* inside the window.
+    pub sentinel_strict: bool,
+    /// Policy C: also rename inside the body of a helper pulled in by reference.
+    pub sentinel_expand_helpers: bool,
+    /// Resolve, filter, print the selection, and exit without making a single
+    /// LLM call.
+    pub dry_run: bool,
 }
 
 /// Returns Err with a user-facing message if `mode` is not valid for `kind`.
@@ -125,6 +139,19 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         eprintln!("humanify: --max-tokens must be greater than 0");
         return 64;
     }
+
+    let sentinels = match build_sentinel_spec(
+        args.start_sentinel.as_deref(),
+        args.stop_sentinel.as_deref(),
+        args.sentinel_strict,
+        args.sentinel_expand_helpers,
+    ) {
+        Ok(spec) => spec,
+        Err(msg) => {
+            eprintln!("humanify: {msg}");
+            return 64;
+        }
+    };
 
     let extra = match args.extra_body.as_deref().map(parse_extra_body).transpose() {
         Ok(map) => map.unwrap_or_default(),
@@ -264,6 +291,8 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
             refresh_cache: args.refresh_cache,
             max_retries,
             max_run_seconds: args.max_run_seconds,
+            sentinels: sentinels.as_ref(),
+            dry_run: args.dry_run,
         });
     }
 
@@ -274,6 +303,19 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
             return 1;
         }
     };
+
+    let options = RenameOptions {
+        context_size: cfg.context_size,
+        cache_context_size: cfg.cache_context_size,
+        sentinels,
+    };
+
+    // `--dry-run` answers "did I select the right region?" for free. It returns
+    // before any HTTP client, tokio runtime or cache exists, so a mis-aimed
+    // window costs nothing to discover.
+    if args.dry_run {
+        return run_dry_run(&source, &options);
+    }
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
@@ -327,10 +369,7 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
 
     let mut observer =
         CliObserver::new(cfg.verbose, args.progress, Arc::clone(&ladder), cache_stats);
-    let options = RenameOptions {
-        context_size: cfg.context_size,
-        cache_context_size: cfg.cache_context_size,
-    };
+
     let joined = rt.block_on(async move {
         tokio::task::spawn_blocking(move || {
             let res = rename_all_identifiers_with_options(
@@ -360,11 +399,131 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
             eprintln!("humanify: parse error: {msg}");
             return 2;
         }
+        Err(RenameError::Sentinel(msg)) => {
+            eprintln!("humanify: {msg}");
+            return 64;
+        }
     };
 
     if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
         eprintln!("humanify: failed to write output: {e}");
         return 1;
+    }
+
+    0
+}
+
+/// Validate the sentinel flags and resolve any `@file` indirection.
+///
+/// Returns `None` when no window was requested — the whole file, i.e. the
+/// behaviour humanify has always had.
+fn build_sentinel_spec(
+    start: Option<&str>,
+    stop: Option<&str>,
+    strict: bool,
+    expand_helpers: bool,
+) -> Result<Option<SentinelSpec>, String> {
+    if strict && expand_helpers {
+        return Err(
+            "--sentinel-strict and --sentinel-expand-helpers select different \
+                    selection policies and cannot be combined"
+                .to_string(),
+        );
+    }
+
+    if start.is_none() && stop.is_none() {
+        // Without a window both policy flags are silent no-ops (the whole file is
+        // selected either way), and the likely intent — renaming one region —
+        // would be missed while still spending the money.
+        if strict || expand_helpers {
+            return Err(
+                "--sentinel-strict and --sentinel-expand-helpers need a window; \
+                        pass --start-sentinel and/or --stop-sentinel"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
+    let policy = if strict {
+        SelectionPolicy::Strict
+    } else if expand_helpers {
+        SelectionPolicy::ExpandHelpers
+    } else {
+        SelectionPolicy::DeclOrReference
+    };
+
+    Ok(Some(SentinelSpec {
+        start: start
+            .map(|arg| sentinel::parse_arg("--start-sentinel", arg))
+            .transpose()?,
+        stop: stop
+            .map(|arg| sentinel::parse_arg("--stop-sentinel", arg))
+            .transpose()?,
+        policy,
+    }))
+}
+
+/// Resolve the window, apply the filter, print what was selected, and stop.
+///
+/// Deliberately does not construct a `Renamer` that can talk to anything: the
+/// identity renamer below is the only one the walker ever sees, so "zero LLM
+/// calls" is a property of the wiring rather than a promise.
+fn run_dry_run(source: &str, options: &RenameOptions) -> i32 {
+    struct NoCallRenamer;
+    impl Renamer for NoCallRenamer {
+        fn rename(&mut self, original: &str, _surrounding: &str) -> String {
+            original.to_string()
+        }
+    }
+
+    #[derive(Default)]
+    struct DryRunObserver {
+        report: Option<SentinelReport>,
+        names: Vec<String>,
+    }
+    impl RenameObserver for DryRunObserver {
+        fn sentinel_window(&mut self, report: &SentinelReport) {
+            self.report = Some(report.clone());
+        }
+        fn rename_started(&mut self, _current: usize, _total: usize, original: &str) {
+            self.names.push(original.to_string());
+        }
+    }
+
+    let mut renamer = NoCallRenamer;
+    let mut observer = DryRunObserver::default();
+    match rename_all_identifiers_with_options(source, &mut renamer, options, &mut observer) {
+        Ok(_) => {}
+        Err(RenameError::Parse(msg)) => {
+            eprintln!("humanify: parse error: {msg}");
+            return 2;
+        }
+        Err(RenameError::Sentinel(msg)) => {
+            eprintln!("humanify: {msg}");
+            return 64;
+        }
+    }
+
+    eprintln!("humanify: dry run: no LLM calls made, no output written");
+    match &observer.report {
+        Some(report) => eprintln!("humanify: sentinel window: {report}"),
+        None => eprintln!(
+            "humanify: whole file: {} identifiers selected",
+            observer.names.len()
+        ),
+    }
+    if observer.names.is_empty() {
+        eprintln!("humanify: selected identifiers: (none)");
+    } else {
+        // Sorted and deduped rather than shown in rename order: a minified
+        // region binds `e` in a dozen scopes, and a reader checking "did I catch
+        // `_D`, and did `xue` come along?" wants a scannable set, not the work
+        // queue. The counts above are the authoritative per-binding numbers.
+        let mut names = observer.names;
+        names.sort_unstable();
+        names.dedup();
+        eprintln!("humanify: selected identifiers: {}", names.join(", "));
     }
 
     0
@@ -397,6 +556,8 @@ struct VerboseConfigOptions<'a> {
     refresh_cache: bool,
     max_retries: u32,
     max_run_seconds: Option<u64>,
+    sentinels: Option<&'a SentinelSpec>,
+    dry_run: bool,
 }
 
 fn print_verbose_config(opts: VerboseConfigOptions<'_>) {
@@ -498,10 +659,38 @@ fn print_verbose_config(opts: VerboseConfigOptions<'_>) {
     } else {
         eprintln!("* max run: unlimited");
     }
+    match opts.sentinels {
+        Some(spec) => {
+            match &spec.start {
+                Some(fragment) => eprintln!("* start sentinel: {fragment:?}"),
+                None => eprintln!("* start sentinel: unset (start of file)"),
+            }
+            match &spec.stop {
+                Some(fragment) => eprintln!("* stop sentinel: {fragment:?}"),
+                None => eprintln!("* stop sentinel: unset (end of file)"),
+            }
+            eprintln!("* selection policy: {}", policy_name(spec.policy));
+        }
+        None => eprintln!("* sentinels: unset (whole file)"),
+    }
+    if opts.dry_run {
+        eprintln!("* dry run: selection only, no LLM calls");
+    }
     eprintln!("* input: {input}");
     match output {
         Some(path) => eprintln!("* output: {}", path.display()),
         None => eprintln!("* output: stdout"),
+    }
+}
+
+fn policy_name(policy: SelectionPolicy) -> &'static str {
+    match policy {
+        SelectionPolicy::Strict => "declaration in window (--sentinel-strict)",
+        SelectionPolicy::DeclOrReference => "declaration or reference in window (default)",
+        SelectionPolicy::ExpandHelpers => {
+            "declaration or reference in window, plus pulled-in helper bodies \
+             (--sentinel-expand-helpers)"
+        }
     }
 }
 
@@ -650,6 +839,19 @@ impl CliObserver {
 }
 
 impl RenameObserver for CliObserver {
+    /// Printed unconditionally, not just under `--verbose`: a mis-aimed window
+    /// spends real money, and this makes it obvious in the first second of a run
+    /// rather than after it finishes.
+    fn sentinel_window(&mut self, report: &SentinelReport) {
+        eprintln!("humanify: sentinel window: {report}");
+        if report.selected == 0 {
+            eprintln!(
+                "humanify: nothing to do — the window contains no renameable identifiers. \
+                 Re-check the fragments with --dry-run."
+            );
+        }
+    }
+
     fn identifiers_found(&mut self, total: usize) {
         self.total = total;
         if self.verbose {
@@ -1120,6 +1322,11 @@ mod tests {
             max_run_seconds: None,
             max_tokens: None,
             extra_body: None,
+            start_sentinel: None,
+            stop_sentinel: None,
+            sentinel_strict: false,
+            sentinel_expand_helpers: false,
+            dry_run: false,
         }
     }
 
@@ -1198,6 +1405,151 @@ mod tests {
             ProviderKind::Anthropic,
         );
         assert_eq!(ladder.strategy_count(), 1);
+    }
+
+    // --- build_sentinel_spec ---
+
+    fn spec_of(start: Option<&str>, stop: Option<&str>) -> Option<SentinelSpec> {
+        build_sentinel_spec(start, stop, false, false).expect("expected a valid spec")
+    }
+
+    #[test]
+    fn no_sentinel_flags_yields_no_spec() {
+        assert_eq!(spec_of(None, None), None);
+    }
+
+    #[test]
+    fn start_only_defaults_to_policy_b() {
+        let spec = spec_of(Some("frag"), None).expect("a spec");
+        assert_eq!(spec.start.as_deref(), Some("frag"));
+        assert_eq!(spec.stop, None);
+        assert_eq!(spec.policy, SelectionPolicy::DeclOrReference);
+    }
+
+    #[test]
+    fn strict_flag_selects_policy_a() {
+        let spec = build_sentinel_spec(Some("frag"), None, true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.policy, SelectionPolicy::Strict);
+    }
+
+    #[test]
+    fn expand_helpers_flag_selects_policy_c() {
+        let spec = build_sentinel_spec(Some("frag"), None, false, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.policy, SelectionPolicy::ExpandHelpers);
+    }
+
+    #[test]
+    fn strict_and_expand_helpers_conflict() {
+        let msg = build_sentinel_spec(Some("frag"), None, true, true).unwrap_err();
+        assert!(msg.contains("cannot be combined"), "{msg}");
+    }
+
+    #[test]
+    fn a_policy_flag_without_a_window_is_an_error() {
+        // Silently selecting the whole file would miss the likely intent while
+        // still spending the money.
+        let msg = build_sentinel_spec(None, None, true, false).unwrap_err();
+        assert!(msg.contains("--start-sentinel"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_fragment_is_an_error() {
+        assert!(build_sentinel_spec(Some(""), None, false, false).is_err());
+    }
+
+    #[test]
+    fn a_fragment_reads_from_an_at_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stop.txt");
+        std::fs::write(&path, "return n.filter(Boolean)\n").unwrap();
+        let spec = spec_of(None, Some(&format!("@{}", path.display()))).expect("a spec");
+        assert_eq!(spec.stop.as_deref(), Some("return n.filter(Boolean)"));
+    }
+
+    // --- run_preset sentinel paths (no network reached) ---
+
+    /// Points at an unroutable port, so any run that *did* try to call a
+    /// provider would fail loudly rather than pass by accident.
+    fn sentinel_args(input: &str, start: Option<&str>, dry_run: bool) -> PresetArgs {
+        PresetArgs {
+            input: input.to_string(),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            api_key: Some("test".to_string()),
+            start_sentinel: start.map(str::to_string),
+            dry_run,
+            ..preset_args_no_io("ladder")
+        }
+    }
+
+    fn temp_js(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, "{contents}").unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn conflicting_policy_flags_return_64_before_any_io() {
+        let args = PresetArgs {
+            start_sentinel: Some("frag".to_string()),
+            sentinel_strict: true,
+            sentinel_expand_helpers: true,
+            ..preset_args_no_io("ladder")
+        };
+        assert_eq!(run_preset(args, crate::cli::openai::DEFAULTS), 64);
+    }
+
+    #[test]
+    fn an_unmatched_fragment_returns_64() {
+        let file = temp_js("const a = 1; const b = 2;");
+        let path = file.path().to_str().unwrap().to_string();
+        let args = sentinel_args(&path, Some("no such fragment"), false);
+        assert_eq!(run_preset(args, crate::cli::openai::DEFAULTS), 64);
+    }
+
+    #[test]
+    fn an_ambiguous_fragment_returns_64() {
+        let file = temp_js("const a = 1; const b = 2;");
+        let path = file.path().to_str().unwrap().to_string();
+        let args = sentinel_args(&path, Some("const "), false);
+        assert_eq!(run_preset(args, crate::cli::openai::DEFAULTS), 64);
+    }
+
+    #[test]
+    fn dry_run_succeeds_without_reaching_a_provider() {
+        // The base URL is unroutable, so a zero exit code is only possible if no
+        // client was ever built.
+        let file = temp_js("const a = 1; const b = 2; const c = 3;");
+        let path = file.path().to_str().unwrap().to_string();
+        let args = sentinel_args(&path, Some("const b"), true);
+        assert_eq!(run_preset(args, crate::cli::openai::DEFAULTS), 0);
+    }
+
+    #[test]
+    fn dry_run_writes_no_output_file() {
+        let file = temp_js("const a = 1; const b = 2;");
+        let path = file.path().to_str().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.js");
+        let args = PresetArgs {
+            output: Some(out.clone()),
+            ..sentinel_args(&path, Some("const b"), true)
+        };
+        assert_eq!(run_preset(args, crate::cli::openai::DEFAULTS), 0);
+        assert!(!out.exists(), "a dry run must not write output");
+    }
+
+    #[test]
+    fn dry_run_without_sentinels_still_reports_and_makes_no_calls() {
+        let file = temp_js("const a = 1;");
+        let path = file.path().to_str().unwrap().to_string();
+        let args = sentinel_args(&path, None, true);
+        assert_eq!(run_preset(args, crate::cli::openai::DEFAULTS), 0);
     }
 
     #[test]

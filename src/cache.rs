@@ -15,7 +15,10 @@ pub const CACHE_FORMAT: &str = "humanify-cache-v1";
 /// rejected up front: a non-ASCII key would panic on a non-char-boundary slice,
 /// and one containing `..` or a separator would escape the cache root.
 fn is_valid_key(key: &str) -> bool {
-    key.len() == 64 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Length-prefixed sha256 so that no two different field splits can collide
@@ -1286,11 +1289,11 @@ mod tests {
         for bad in [
             "",
             "a",
-            "é9",                                                               // multi-byte lead
-            "../../../../etc/passwd",                                           // traversal
-            "ZZ00000000000000000000000000000000000000000000000000000000000000",  // non-hex
-            "AB00000000000000000000000000000000000000000000000000000000000000",  // uppercase
-            "ab0000000000000000000000000000000000000000000000000000000000000",   // 63 chars
+            "é9",                     // multi-byte lead
+            "../../../../etc/passwd", // traversal
+            "ZZ00000000000000000000000000000000000000000000000000000000000000", // non-hex
+            "AB00000000000000000000000000000000000000000000000000000000000000", // uppercase
+            "ab0000000000000000000000000000000000000000000000000000000000000", // 63 chars
         ] {
             assert_eq!(cache.get(bad, "a", &sha), None, "get({bad:?})");
             let entry = CacheEntry::new(bad, "n", "a", &sha, &scope);

@@ -102,6 +102,35 @@ struct SubArgs {
     #[arg(long)]
     extra_body: Option<String>,
 
+    /// Literal fragment of the input marking where renaming starts, or
+    /// `@file.txt` to read the fragment from a file. Copy it from the input
+    /// itself and check in your editor that it matches exactly once — 0 or 2+
+    /// matches are hard errors. Combine with --stop-sentinel to bound a region.
+    #[arg(long)]
+    start_sentinel: Option<String>,
+
+    /// Literal fragment of the input marking where renaming stops (inclusive),
+    /// or `@file.txt`. Same matching rules as --start-sentinel.
+    #[arg(long)]
+    stop_sentinel: Option<String>,
+
+    /// Only rename identifiers *declared* inside the sentinel window. By default
+    /// a helper declared elsewhere but referenced inside the window is renamed
+    /// too, so its call sites in the region read meaningfully.
+    #[arg(long)]
+    sentinel_strict: bool,
+
+    /// Also rename inside the body of a helper the window pulled in by
+    /// reference. Costs 10-50x more per helper; worth it when the callee is your
+    /// own code rather than a third-party bundle.
+    #[arg(long, conflicts_with = "sentinel_strict")]
+    sentinel_expand_helpers: bool,
+
+    /// Resolve the sentinels, print the window and the identifiers it selects,
+    /// and exit without making a single LLM call.
+    #[arg(long)]
+    dry_run: bool,
+
     /// Show resolved configuration and rename steps on stderr
     #[arg(short, long)]
     verbose: bool,
@@ -131,6 +160,11 @@ fn into_openai_args(a: SubArgs) -> openai::Args {
         max_run_seconds: a.max_run_seconds,
         max_tokens: a.max_tokens,
         extra_body: a.extra_body,
+        start_sentinel: a.start_sentinel,
+        stop_sentinel: a.stop_sentinel,
+        sentinel_strict: a.sentinel_strict,
+        sentinel_expand_helpers: a.sentinel_expand_helpers,
+        dry_run: a.dry_run,
     }
 }
 
@@ -154,6 +188,11 @@ fn into_gemini_args(a: SubArgs) -> gemini::Args {
         max_run_seconds: a.max_run_seconds,
         max_tokens: a.max_tokens,
         extra_body: a.extra_body,
+        start_sentinel: a.start_sentinel,
+        stop_sentinel: a.stop_sentinel,
+        sentinel_strict: a.sentinel_strict,
+        sentinel_expand_helpers: a.sentinel_expand_helpers,
+        dry_run: a.dry_run,
     }
 }
 
@@ -177,6 +216,11 @@ fn into_anthropic_args(a: SubArgs) -> anthropic::Args {
         max_run_seconds: a.max_run_seconds,
         max_tokens: a.max_tokens,
         extra_body: a.extra_body,
+        start_sentinel: a.start_sentinel,
+        stop_sentinel: a.stop_sentinel,
+        sentinel_strict: a.sentinel_strict,
+        sentinel_expand_helpers: a.sentinel_expand_helpers,
+        dry_run: a.dry_run,
     }
 }
 
@@ -200,6 +244,11 @@ fn into_ollama_args(a: SubArgs) -> ollama::Args {
         max_run_seconds: a.max_run_seconds,
         max_tokens: a.max_tokens,
         extra_body: a.extra_body,
+        start_sentinel: a.start_sentinel,
+        stop_sentinel: a.stop_sentinel,
+        sentinel_strict: a.sentinel_strict,
+        sentinel_expand_helpers: a.sentinel_expand_helpers,
+        dry_run: a.dry_run,
     }
 }
 
@@ -223,6 +272,11 @@ fn into_openrouter_args(a: SubArgs) -> openrouter::Args {
         max_run_seconds: a.max_run_seconds,
         max_tokens: a.max_tokens,
         extra_body: a.extra_body,
+        start_sentinel: a.start_sentinel,
+        stop_sentinel: a.stop_sentinel,
+        sentinel_strict: a.sentinel_strict,
+        sentinel_expand_helpers: a.sentinel_expand_helpers,
+        dry_run: a.dry_run,
     }
 }
 
@@ -246,6 +300,11 @@ fn into_requesty_args(a: SubArgs) -> requesty::Args {
         max_run_seconds: a.max_run_seconds,
         max_tokens: a.max_tokens,
         extra_body: a.extra_body,
+        start_sentinel: a.start_sentinel,
+        stop_sentinel: a.stop_sentinel,
+        sentinel_strict: a.sentinel_strict,
+        sentinel_expand_helpers: a.sentinel_expand_helpers,
+        dry_run: a.dry_run,
     }
 }
 

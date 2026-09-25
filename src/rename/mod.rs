@@ -1,9 +1,11 @@
 mod collision;
 mod safe_name;
+pub mod sentinel;
 #[cfg(test)]
 pub mod test_dsl;
 mod walker;
 
+pub use sentinel::{SelectionPolicy, SentinelReport, SentinelSpec, SentinelWindow};
 pub use walker::{
     rename_all_identifiers, rename_all_identifiers_with_observer,
     rename_all_identifiers_with_options, RenameOptions,
@@ -98,6 +100,11 @@ pub trait Renamer {
 /// from name equality; conversely, a failure that also emitted `rename_finished`
 /// would let every failure reset the caller's own failure counter.
 pub trait RenameObserver {
+    /// A sentinel window was resolved and applied. Emitted once, before
+    /// `identifiers_found`, and only when `--start-sentinel`/`--stop-sentinel`
+    /// were given.
+    fn sentinel_window(&mut self, _report: &SentinelReport) {}
+
     fn identifiers_found(&mut self, _total: usize) {}
 
     fn rename_started(&mut self, _current: usize, _total: usize, _original: &str) {}
@@ -126,4 +133,9 @@ impl RenameObserver for NoopRenameObserver {}
 pub enum RenameError {
     #[error("failed to parse JavaScript: {0}")]
     Parse(String),
+    /// A `--start-sentinel` / `--stop-sentinel` fragment did not resolve to
+    /// exactly one usable window. A CLI usage error (exit 64), not a failure of
+    /// the input: nothing was read from the model and nothing was written.
+    #[error("{0}")]
+    Sentinel(String),
 }

@@ -415,7 +415,11 @@ fn very_large_budgets_are_accepted_and_not_clamped() {
             .success();
 
         let contents = std::fs::read_to_string(&out_path).unwrap();
-        assert_eq!(contents.trim(), "const x = 1;", "--max-run-seconds {seconds}");
+        assert_eq!(
+            contents.trim(),
+            "const x = 1;",
+            "--max-run-seconds {seconds}"
+        );
     }
 }
 
@@ -987,4 +991,226 @@ fn unwritable_cache_dir_still_produces_output() {
     assert!(stderr.contains("cache disabled"), "stderr:\n{stderr}");
     let contents = std::fs::read_to_string(&out_path).unwrap();
     assert_eq!(contents.trim(), "const x = 1;");
+}
+
+// --- sentinel-bounded renaming ---
+
+/// A helper (`helperFn`) declared before the marked region and called inside it,
+/// a local in the region, and a function after it that the region never touches.
+const SENTINEL_SOURCE: &str = concat!(
+    "function helperFn(input) { return input + 1; }\n",
+    "function afterFn() { const late = 3; return late; }\n",
+    "function target() { const local = helperFn(2); return local; }\n",
+);
+
+/// Only the identifiers inside the window are bought, and the ones outside keep
+/// their original names — the whole point of the feature.
+#[test]
+fn a_sentinel_window_limits_which_identifiers_are_bought() {
+    let server = StubServer::suggesting("renamed");
+    let (_out, out_path) = out_file();
+
+    let assert = Command::cargo_bin("humanify")
+        .unwrap()
+        .args([
+            "openai",
+            "-",
+            "-o",
+            out_path.to_str().unwrap(),
+            "--base-url",
+            &server.base_url,
+            "--start-sentinel",
+            "function target",
+            "--stop-sentinel",
+            "return local; }",
+        ])
+        .write_stdin(SENTINEL_SOURCE)
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("sentinel window: bytes"),
+        "the resolved window is reported without --verbose:\n{stderr}"
+    );
+    // target + local + helperFn (called inside the window). Not afterFn, not
+    // `late`, not `input`.
+    assert!(
+        stderr.contains("3 of 6 identifiers selected"),
+        "stderr:\n{stderr}"
+    );
+    assert_eq!(server.requests(), 3, "one call per selected identifier");
+
+    let contents = std::fs::read_to_string(&out_path).unwrap();
+    assert!(
+        contents.contains("function afterFn"),
+        "an out-of-window function keeps its name:\n{contents}"
+    );
+    assert!(
+        contents.contains("late"),
+        "an out-of-window local keeps its name:\n{contents}"
+    );
+    assert!(
+        !contents.contains("helperFn"),
+        "a helper called inside the window is renamed:\n{contents}"
+    );
+}
+
+#[test]
+fn dry_run_prints_the_selection_and_makes_zero_requests() {
+    let server = StubServer::suggesting("renamed");
+    let (_out, out_path) = out_file();
+
+    let assert = Command::cargo_bin("humanify")
+        .unwrap()
+        .args([
+            "openai",
+            "-",
+            "-o",
+            out_path.to_str().unwrap(),
+            "--base-url",
+            &server.base_url,
+            "--start-sentinel",
+            "function target",
+            "--stop-sentinel",
+            "return local; }",
+            "--dry-run",
+        ])
+        .write_stdin(SENTINEL_SOURCE)
+        .assert()
+        .success();
+
+    assert_eq!(server.requests(), 0, "a dry run must not call the provider");
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("dry run"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("sentinel window: bytes"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("selected identifiers: helperFn, local, target"),
+        "stderr:\n{stderr}"
+    );
+
+    // `-o` was given, and a dry run still leaves it untouched.
+    assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "");
+}
+
+#[test]
+fn an_ambiguous_fragment_fails_with_64_listing_every_occurrence() {
+    let server = StubServer::suggesting("renamed");
+
+    let assert = Command::cargo_bin("humanify")
+        .unwrap()
+        .args([
+            "openai",
+            "-",
+            "--base-url",
+            &server.base_url,
+            "--start-sentinel",
+            "function ",
+        ])
+        .write_stdin(SENTINEL_SOURCE)
+        .assert()
+        .code(64);
+
+    assert_eq!(server.requests(), 0, "nothing is bought before resolution");
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("matches 3 times"), "stderr:\n{stderr}");
+    assert!(stderr.contains("1:1"), "stderr:\n{stderr}");
+    assert!(stderr.contains("2:1"), "stderr:\n{stderr}");
+    assert!(stderr.contains("3:1"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn a_sentinel_fragment_reads_from_an_at_file() {
+    let server = StubServer::suggesting("renamed");
+    let dir = tempfile::tempdir().unwrap();
+    let fragment = dir.path().join("start.txt");
+    // Trailing newline as an editor would leave it; quoting this on a shell
+    // command line is exactly what `@file` exists to avoid.
+    std::fs::write(&fragment, "const local = helperFn(2);\n").unwrap();
+
+    let assert = Command::cargo_bin("humanify")
+        .unwrap()
+        .args([
+            "openai",
+            "-",
+            "--base-url",
+            &server.base_url,
+            "--start-sentinel",
+            &format!("@{}", fragment.display()),
+            "--dry-run",
+        ])
+        .write_stdin(SENTINEL_SOURCE)
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("selected identifiers: helperFn, local"),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// The cache key covers the question only, so a sentinel run and a later
+/// whole-file run share answers: buy the region with an expensive model, then
+/// sweep the rest cheaply without re-buying it.
+#[test]
+fn a_sentinel_run_warms_the_cache_for_a_later_whole_file_run() {
+    let server = StubServer::suggesting("renamed");
+    let cache = tempfile::tempdir().unwrap();
+
+    let (_o1, p1) = out_file();
+    Command::cargo_bin("humanify")
+        .unwrap()
+        .args([
+            "openai",
+            "-",
+            "-o",
+            p1.to_str().unwrap(),
+            "--base-url",
+            &server.base_url,
+            "--cache-dir",
+            cache.path().to_str().unwrap(),
+            "--start-sentinel",
+            "function target",
+            "--stop-sentinel",
+            "return local; }",
+        ])
+        .write_stdin(SENTINEL_SOURCE)
+        .assert()
+        .success();
+    let after_region = server.requests();
+    assert_eq!(after_region, 3);
+
+    let (_o2, p2) = out_file();
+    let assert = Command::cargo_bin("humanify")
+        .unwrap()
+        .args([
+            "openai",
+            "-",
+            "-o",
+            p2.to_str().unwrap(),
+            "--base-url",
+            &server.base_url,
+            "--cache-dir",
+            cache.path().to_str().unwrap(),
+            "--verbose",
+        ])
+        .write_stdin(SENTINEL_SOURCE)
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("3 hits"),
+        "the region's answers should be reused verbatim:\n{stderr}"
+    );
+    assert_eq!(
+        server.requests(),
+        after_region + 3,
+        "only the three identifiers outside the region are bought"
+    );
 }

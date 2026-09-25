@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 
+use super::sentinel::{SelectionPolicy, SentinelReport, SentinelSpec};
 use super::{
-    rename_all_identifiers, rename_all_identifiers_with_options, NoopRenameObserver, RenameOptions,
-    RenameOutcome, RenameRequest, Renamer,
+    rename_all_identifiers_with_options, NoopRenameObserver, RenameError, RenameObserver,
+    RenameOptions, RenameOutcome, RenameRequest, Renamer,
 };
 
 // --- Renamer constructors ---
@@ -172,6 +173,7 @@ pub struct ScenarioBuilder {
     source: String,
     context_size: usize,
     cache_context_size: Option<usize>,
+    sentinels: Option<SentinelSpec>,
 }
 
 pub fn scenario(source: &str) -> ScenarioBuilder {
@@ -179,6 +181,18 @@ pub fn scenario(source: &str) -> ScenarioBuilder {
         source: source.to_string(),
         context_size: 200,
         cache_context_size: None,
+        sentinels: None,
+    }
+}
+
+/// Captures the resolved-window report so a test can assert on the counts the
+/// CLI would print.
+#[derive(Default)]
+struct ReportObserver(Option<SentinelReport>);
+
+impl RenameObserver for ReportObserver {
+    fn sentinel_window(&mut self, report: &SentinelReport) {
+        self.0 = Some(report.clone());
     }
 }
 
@@ -194,13 +208,40 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Bound the run by a start fragment.
+    pub fn from(mut self, fragment: &str) -> Self {
+        self.sentinels
+            .get_or_insert_with(SentinelSpec::default)
+            .start = Some(fragment.to_string());
+        self
+    }
+
+    /// Bound the run by a stop fragment.
+    pub fn until(mut self, fragment: &str) -> Self {
+        self.sentinels
+            .get_or_insert_with(SentinelSpec::default)
+            .stop = Some(fragment.to_string());
+        self
+    }
+
+    pub fn between(self, start: &str, stop: &str) -> Self {
+        self.from(start).until(stop)
+    }
+
+    pub fn with_policy(mut self, policy: SelectionPolicy) -> Self {
+        self.sentinels
+            .get_or_insert_with(SentinelSpec::default)
+            .policy = policy;
+        self
+    }
+
     fn options(&self) -> RenameOptions {
         RenameOptions {
             context_size: self.context_size,
             cache_context_size: self.cache_context_size.unwrap_or(self.context_size),
+            sentinels: self.sentinels.clone(),
         }
     }
-
     fn run(&self, renamer: &mut dyn Renamer) -> String {
         rename_all_identifiers_with_options(
             &self.source,
@@ -222,9 +263,46 @@ impl ScenarioBuilder {
         (RenamedScenario { output }, renamer.log)
     }
 
+    /// Like `with_recording`, but also hands back the window report the CLI
+    /// would print.
+    pub fn with_recorded_report(
+        self,
+        mut renamer: RecordingRenamer,
+    ) -> (CallLog, Option<SentinelReport>) {
+        let mut observer = ReportObserver::default();
+        rename_all_identifiers_with_options(
+            &self.source,
+            &mut renamer,
+            &self.options(),
+            &mut observer,
+        )
+        .expect("rename_all_identifiers failed");
+        (renamer.log, observer.0)
+    }
+
+    /// Asserts the run fails sentinel resolution, and returns the message.
+    pub fn sentinel_error(self) -> String {
+        let result = rename_all_identifiers_with_options(
+            &self.source,
+            &mut IdentityRenamer,
+            &self.options(),
+            &mut super::NoopRenameObserver,
+        );
+        match result {
+            Err(RenameError::Sentinel(msg)) => msg,
+            Err(other) => panic!("expected a sentinel error, got {other:?}"),
+            Ok(_) => panic!("expected a sentinel error, but the run succeeded"),
+        }
+    }
+
     pub fn parses_unchanged(self) {
-        let output = rename_all_identifiers(&self.source, &mut IdentityRenamer, self.context_size)
-            .expect("rename_all_identifiers failed");
+        let output = rename_all_identifiers_with_options(
+            &self.source,
+            &mut IdentityRenamer,
+            &self.options(),
+            &mut super::NoopRenameObserver,
+        )
+        .expect("rename_all_identifiers failed");
         let got = output.trim_end_matches('\n');
         assert_eq!(
             got,

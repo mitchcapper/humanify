@@ -31,6 +31,11 @@ pub struct Args {
     pub max_run_seconds: Option<u64>,
     pub max_tokens: Option<u32>,
     pub extra_body: Option<String>,
+    pub start_sentinel: Option<String>,
+    pub stop_sentinel: Option<String>,
+    pub sentinel_strict: bool,
+    pub sentinel_expand_helpers: bool,
+    pub dry_run: bool,
 }
 
 impl From<Args> for PresetArgs {
@@ -54,6 +59,11 @@ impl From<Args> for PresetArgs {
             max_run_seconds: a.max_run_seconds,
             max_tokens: a.max_tokens,
             extra_body: a.extra_body,
+            start_sentinel: a.start_sentinel,
+            stop_sentinel: a.stop_sentinel,
+            sentinel_strict: a.sentinel_strict,
+            sentinel_expand_helpers: a.sentinel_expand_helpers,
+            dry_run: a.dry_run,
         }
     }
 }

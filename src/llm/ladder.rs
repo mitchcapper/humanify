@@ -208,7 +208,10 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_propagates_no_lock_no_dead() {
-        let s0 = script("s0", vec![ScriptedResponse::Permanent("bad api key".into())]);
+        let s0 = script(
+            "s0",
+            vec![ScriptedResponse::Permanent("bad api key".into())],
+        );
         let outcome = ladder_with(vec![s0, not_supported("s1", "unused")])
             .called_n_times(1)
             .await;

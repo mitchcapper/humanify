@@ -8,6 +8,7 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_str::Ident;
 
 use super::collision::CollisionResolver;
+use super::sentinel::{self, SelectionPolicy, SentinelReport, SentinelSpec, SentinelWindow};
 use super::{
     NoopRenameObserver, RenameError, RenameObserver, RenameOutcome, RenameRequest, Renamer,
 };
@@ -15,13 +16,16 @@ use super::{
 /// Everything that shapes a run other than the renamer and the observer.
 #[derive(Clone, Debug, Default)]
 pub struct RenameOptions {
-    /// Surrounding code handed to the model per identifier.
+    /// Surrounding-code characters handed to the model per identifier.
     pub context_size: usize,
     /// Surrounding code used to build the cache key, independently of what the
     /// model is shown (`--cache-context-size`). Equal to `context_size` unless
     /// the flag is given, in which case runs at different `context_size` values
     /// can still share cache entries.
     pub cache_context_size: usize,
+    /// When set, only the symbols visible in the resolved window are renamed.
+    /// `None` (and a spec with neither fragment) means the whole file.
+    pub sentinels: Option<SentinelSpec>,
 }
 
 impl RenameOptions {
@@ -31,6 +35,7 @@ impl RenameOptions {
         RenameOptions {
             context_size,
             cache_context_size: context_size,
+            sentinels: None,
         }
     }
 }
@@ -66,6 +71,13 @@ pub fn rename_all_identifiers_with_options(
     let context_size = options.context_size;
     let cache_context_size = options.cache_context_size;
 
+    // Resolve sentinels before parsing: a mistyped fragment is a usage error and
+    // should cost nothing, and resolution needs only the raw bytes.
+    let window = match options.sentinels.as_ref().filter(|s| s.is_bounded()) {
+        Some(spec) => Some(sentinel::resolve(source, spec).map_err(RenameError::Sentinel)?),
+        None => None,
+    };
+
     if source.is_empty() {
         observer.identifiers_found(0);
         return Ok(String::new());
@@ -97,7 +109,7 @@ pub fn rename_all_identifiers_with_options(
     let mut semantic = semantic_result.semantic;
 
     // Collect all symbols with their binding-scope span sizes for sorting.
-    let mut entries: Vec<(SymbolId, u32, u32)> = {
+    let all: Vec<(SymbolId, u32, u32)> = {
         let scoping = semantic.scoping();
         let nodes = semantic.nodes();
         scoping
@@ -121,10 +133,25 @@ pub fn rename_all_identifiers_with_options(
             })
             .collect()
     };
+    let file_total = all.len();
+
+    // The sentinel filter is the whole feature: it changes *membership* of the
+    // work list and nothing else. Every surviving member is still prompted with
+    // its declaration-derived context window, and skipped symbols still seed the
+    // collision resolver, so the safety of the result is unaffected.
+    let mut entries = match &window {
+        Some(w) => select_in_window(source, &all, w, semantic.scoping(), semantic.nodes()),
+        None => all,
+    };
 
     // Sort: largest scope first; ties broken by source position (ascending).
     entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
     let total = entries.len();
+    // `total` is taken *after* filtering, or the progress bar stalls at a
+    // fraction of 100%.
+    if let Some(w) = &window {
+        observer.sentinel_window(&SentinelReport::new(source, w, total, file_total));
+    }
     observer.identifiers_found(total);
 
     let mut visited: HashSet<SymbolId> = HashSet::new();
@@ -246,6 +273,88 @@ pub fn rename_all_identifiers_with_options(
         .code;
 
     Ok(output)
+}
+
+/// Restrict the work list to the symbols the window admits.
+///
+/// Entries are `(symbol, context-scope size, declaration offset)`; only the
+/// declaration offset and the symbol's references are consulted here.
+fn select_in_window(
+    source: &str,
+    all: &[(SymbolId, u32, u32)],
+    window: &SentinelWindow,
+    scoping: &Scoping,
+    nodes: &AstNodes<'_>,
+) -> Vec<(SymbolId, u32, u32)> {
+    // Is any *use* of this symbol inside the window? This is what pulls in a
+    // helper declared hundreds of lines earlier but called in the region being
+    // read. Unresolved globals (`Error`, `crypto`) have no symbol at all, so
+    // they cost nothing and never appear here.
+    let referenced_in_window = |sym_id: SymbolId| {
+        scoping
+            .get_resolved_reference_ids(sym_id)
+            .iter()
+            .any(|reference_id| {
+                let node_id = scoping.get_reference(*reference_id).node_id();
+                window.contains(nodes.get_node(node_id).kind().span().start)
+            })
+    };
+
+    let mut keep: HashSet<SymbolId> = HashSet::new();
+    for (sym_id, _, decl_start) in all {
+        let admitted = match window.policy {
+            SelectionPolicy::Strict => window.contains(*decl_start),
+            SelectionPolicy::DeclOrReference | SelectionPolicy::ExpandHelpers => {
+                window.contains(*decl_start) || referenced_in_window(*sym_id)
+            }
+        };
+        if admitted {
+            keep.insert(*sym_id);
+        }
+    }
+
+    if window.policy == SelectionPolicy::ExpandHelpers {
+        // Policy C: for each symbol pulled in *by reference only*, also admit
+        // everything lexically inside its declaration. Applied once over the
+        // policy-B set — never iterated to a fixed point, which would follow one
+        // call into a bundler runtime and end up back at the whole file.
+        let expanded: Vec<(u32, u32)> = all
+            .iter()
+            .filter(|(sym_id, _, decl_start)| {
+                keep.contains(sym_id) && !window.contains(*decl_start)
+            })
+            .map(|(sym_id, _, _)| {
+                let span = nodes
+                    .get_node(scoping.symbol_declaration(*sym_id))
+                    .kind()
+                    .span();
+                (span.start, span.end)
+            })
+            .collect();
+        for (sym_id, _, decl_start) in all {
+            if keep.contains(sym_id) {
+                continue;
+            }
+            if expanded
+                .iter()
+                .any(|&(start, end)| *decl_start >= start && *decl_start < end)
+            {
+                keep.insert(*sym_id);
+            }
+        }
+    }
+
+    all.iter()
+        .filter(|(sym_id, _, _)| keep.contains(sym_id))
+        // Inserted-marker guard — a no-op whenever the fragment is existing
+        // code, which is the normal case. See `SentinelWindow::is_inserted_marker`.
+        .filter(|(sym_id, _, _)| {
+            let span = scoping.symbol_span(*sym_id);
+            let name = scoping.symbol_name(*sym_id);
+            !window.is_inserted_marker(source, span.start, span.end, name)
+        })
+        .copied()
+        .collect()
 }
 
 /// Find the span of the closest binding-introducing ancestor for a given declaration node.
@@ -1173,7 +1282,10 @@ mod tests {
         let src = "const a = 1; let b = 2; var c = 3;";
         rename_all_identifiers_with_observer(src, &mut renamer, 500, &mut obs).unwrap();
         assert_eq!(obs.skipped, 3);
-        assert_eq!(obs.finished, 0, "a skip must not also report rename_finished");
+        assert_eq!(
+            obs.finished, 0,
+            "a skip must not also report rename_finished"
+        );
     }
 
     #[test]
@@ -1213,5 +1325,297 @@ mod tests {
             r.try_rename(&RenameRequest::new("x", "const x = 1;")),
             RenameOutcome::Ok("x".to_string())
         );
+    }
+
+    // --- sentinel-bounded renaming ---
+
+    /// A miniature of the workflow the feature exists for: a region worth
+    /// reading (`_D`), helpers declared before it that the region calls (`xue`,
+    /// `ht`), a helper only `xue` calls (`deep`), a helper nothing in the region
+    /// touches (`unused`), and a function after the region (`mX`).
+    const REGION: &str = r#"const ht = 1;
+function deep(z) { return z; }
+function xue(e) { const t = deep(e), r = t[0]; return r; }
+function unused(a) { const b = a; return b; }
+function _D() { const s = xue(ht); if (!s) throw new Error("x"); return s; }
+function mX() { const q = 2; return q; }
+"#;
+
+    /// The identifiers actually offered to the model, sorted for a stable
+    /// assertion (the rename loop's own order is largest-scope-first).
+    fn selected(builder: super::super::test_dsl::ScenarioBuilder) -> Vec<String> {
+        let (log, _) = builder.with_recorded_report(recording("_x"));
+        let mut names: Vec<String> = log.call_names().iter().map(|s| s.to_string()).collect();
+        names.sort_unstable();
+        names
+    }
+
+    fn region(start: &str, stop: &str) -> super::super::test_dsl::ScenarioBuilder {
+        scenario(REGION).with_context_size(500).between(start, stop)
+    }
+
+    #[test]
+    fn no_sentinels_selects_the_whole_file() {
+        let names = selected(scenario(REGION).with_context_size(500));
+        assert!(names.contains(&"mX".to_string()), "{names:?}");
+        assert!(names.contains(&"unused".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn policy_b_selects_the_region_and_the_helpers_it_calls() {
+        // `xue` and `ht` are declared before the window but *called* inside it,
+        // so the call site reads meaningfully after renaming. `unused` and `mX`
+        // are never mentioned in the window and cost nothing.
+        assert_eq!(
+            selected(region("function _D", "return s; }")),
+            ["_D", "ht", "s", "xue"]
+        );
+    }
+
+    #[test]
+    fn policy_b_does_not_leak_into_a_pulled_in_helper_body() {
+        // The load-bearing test for the cost argument: pulling `xue` in by
+        // reference must not drag its params and locals along, or a window that
+        // calls 15 helpers turns ~15 extra calls into several hundred.
+        let names = selected(region("function _D", "return s; }"));
+        for internal in ["e", "t", "r", "deep", "z"] {
+            assert!(
+                !names.contains(&internal.to_string()),
+                "`{internal}` is internal to a pulled-in helper: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_globals_in_the_window_cost_nothing() {
+        // `Error` has no symbol at all, so it never reaches the work list.
+        let names = selected(region("function _D", "return s; }"));
+        assert!(!names.contains(&"Error".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn strict_policy_selects_only_declarations_in_the_window() {
+        assert_eq!(
+            selected(region("function _D", "return s; }").with_policy(SelectionPolicy::Strict)),
+            ["_D", "s"]
+        );
+    }
+
+    #[test]
+    fn expand_helpers_pulls_in_the_helper_body_one_level_deep() {
+        // `xue`'s own params and locals come along; `deep` — which `xue` calls
+        // but the window never mentions — does not. That pins policy C at one
+        // level, so it cannot quietly grow into a fixed point over the file.
+        assert_eq!(
+            selected(
+                region("function _D", "return s; }").with_policy(SelectionPolicy::ExpandHelpers)
+            ),
+            ["_D", "e", "ht", "r", "s", "t", "xue"]
+        );
+    }
+
+    #[test]
+    fn context_for_a_referenced_helper_comes_from_its_own_declaration() {
+        // Filtering changes membership only: a symbol pulled in *because of* a
+        // call site is still described to the model by the code around its own
+        // declaration. Locks in the property so a future refactor of
+        // `compute_context_window` cannot silently break it.
+        let (log, _) = scenario(REGION)
+            .with_context_size(60)
+            .between("function _D", "return s; }")
+            .with_recorded_report(recording("_x"));
+        let scope = log.scope_for("xue");
+        assert!(
+            scope.contains("const t = deep(e)"),
+            "context should be centred on xue's own declaration: {scope:?}"
+        );
+        assert!(
+            !scope.contains("function _D"),
+            "context must not come from the call site: {scope:?}"
+        );
+    }
+
+    #[test]
+    fn window_report_counts_selected_against_the_whole_file() {
+        let (_, report) =
+            region("function _D", "return s; }").with_recorded_report(recording("_x"));
+        let report = report.expect("a bounded run should report its window");
+        assert_eq!(report.selected, 4);
+        assert!(
+            report.total > report.selected,
+            "total should count the whole file: {report:?}"
+        );
+        assert_eq!(report.start as usize, REGION.find("function _D").unwrap());
+        assert_eq!(
+            report.end as usize,
+            REGION.find("return s; }").unwrap() + "return s; }".len()
+        );
+    }
+
+    #[test]
+    fn no_window_report_without_sentinels() {
+        let (_, report) = scenario(REGION)
+            .with_context_size(500)
+            .with_recorded_report(recording("_x"));
+        assert!(report.is_none());
+    }
+
+    // --- window boundaries and unaligned fragments ---
+
+    const LETTERS: &str = "const a=1; const b=2; const c=3; const d=4; const e=5;";
+
+    #[test]
+    fn both_fragments_are_inside_the_window() {
+        // Start at the *start* of the start-match, end at the *end* of the
+        // stop-match — what "from here to there" means to a reader.
+        assert_eq!(
+            selected(
+                scenario(LETTERS)
+                    .with_context_size(500)
+                    .between("const b", "const d=4")
+            ),
+            ["b", "c", "d"]
+        );
+    }
+
+    #[test]
+    fn start_only_runs_to_the_end_of_the_file() {
+        assert_eq!(
+            selected(scenario(LETTERS).with_context_size(500).from("const c")),
+            ["c", "d", "e"]
+        );
+    }
+
+    #[test]
+    fn stop_only_runs_from_the_start_of_the_file() {
+        assert_eq!(
+            selected(scenario(LETTERS).with_context_size(500).until("const b=2")),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn a_fragment_may_span_a_token_boundary() {
+        // The offsets are only compared against declaration spans, so a fragment
+        // may sit mid-expression or mid-token.
+        assert_eq!(
+            selected(
+                scenario(LETTERS)
+                    .with_context_size(500)
+                    .between("t b=2", "c=3")
+            ),
+            ["b", "c"]
+        );
+    }
+
+    #[test]
+    fn a_fragment_may_sit_inside_a_string_literal() {
+        // The fragment resolves inside `a`'s string literal, which is *after*
+        // `a`'s own declaration — so the window starts there and `a` is out.
+        let src = r#"const a = "const b=2"; const b=2; const c=3;"#;
+        let names = selected(scenario(src).with_context_size(500).from(r#""const b=2""#));
+        assert_eq!(names, ["b", "c"]);
+    }
+
+    // --- hard errors ---
+
+    #[test]
+    fn a_fragment_matching_nothing_is_an_error() {
+        let msg = scenario(LETTERS).from("const z").sentinel_error();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("const z"), "{msg}");
+    }
+
+    #[test]
+    fn a_fragment_matching_twice_is_an_error_listing_each_line_col() {
+        let msg = scenario(LETTERS).from("const ").sentinel_error();
+        assert!(msg.contains("matches 5 times"), "{msg}");
+        assert!(msg.contains("1:1"), "{msg}");
+    }
+
+    #[test]
+    fn a_stop_before_the_start_is_an_error() {
+        let msg = scenario(LETTERS)
+            .between("const d", "const b")
+            .sentinel_error();
+        assert!(msg.contains("before --start-sentinel"), "{msg}");
+    }
+
+    // --- inserted markers ---
+
+    const MARKED: &str =
+        "const a=1; const START_SENTINEL=0; const b=2; const STOP_SENTINEL=0; const c=3;";
+
+    #[test]
+    fn inserted_markers_are_not_offered_to_the_renamer() {
+        assert_eq!(
+            selected(
+                scenario(MARKED)
+                    .with_context_size(500)
+                    .between("START_SENTINEL", "STOP_SENTINEL")
+            ),
+            ["b"]
+        );
+    }
+
+    #[test]
+    fn an_unused_marker_binding_survives_codegen() {
+        // Nothing between parse and print removes unused code, so a marker is
+        // still there afterwards and the same window re-runs on the output.
+        // Guards against a future minifier pass landing upstream of renaming.
+        let out = scenario(MARKED)
+            .with_context_size(500)
+            .between("START_SENTINEL", "STOP_SENTINEL")
+            .renamed_with(suffix("_x"));
+        assert!(out.output().contains("START_SENTINEL"), "{}", out.output());
+        assert!(out.output().contains("STOP_SENTINEL"), "{}", out.output());
+    }
+
+    #[test]
+    fn a_fragment_pointing_at_a_declaration_still_renames_it() {
+        // `--start-sentinel 'function xue('` is the documented way to point at
+        // existing code. Excluding `xue` there would silently drop the very
+        // identifier the user aimed at, so the marker guard must not fire.
+        let names = selected(region("function xue(", "return r; }"));
+        assert!(names.contains(&"xue".to_string()), "{names:?}");
+    }
+
+    // --- interaction with the rest of the pipeline ---
+
+    #[test]
+    fn collisions_still_see_symbols_outside_the_window() {
+        // `unused` is never offered to the model, but renaming an in-window
+        // symbol to `unused` would shadow it — so the in-window one is suffixed.
+        // Filtering changes which symbols get *asked about*, never the safety of
+        // the result.
+        let out = scenario(REGION)
+            .with_context_size(500)
+            .between("function _D", "return s; }")
+            .with_policy(SelectionPolicy::Strict)
+            .renamed_with(mapping(&[("s", "unused")]));
+        assert!(
+            out.output().contains("unused2"),
+            "in-window rename should be suffixed: {}",
+            out.output()
+        );
+        assert!(
+            out.output().contains("function unused("),
+            "the untouched outer binding keeps its name: {}",
+            out.output()
+        );
+    }
+
+    #[test]
+    fn symbols_outside_the_window_keep_their_original_names() {
+        let out = scenario(LETTERS)
+            .with_context_size(500)
+            .between("const b", "const c=3")
+            .renamed_with(suffix("_x"));
+        let o = out.output();
+        assert!(o.contains("a = 1") || o.contains("a=1"), "{o}");
+        assert!(o.contains("b_x"), "{o}");
+        assert!(o.contains("c_x"), "{o}");
+        assert!(!o.contains("d_x"), "{o}");
+        assert!(!o.contains("e_x"), "{o}");
     }
 }

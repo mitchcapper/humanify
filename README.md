@@ -172,6 +172,12 @@ humanify <openai|gemini|anthropic|ollama|openrouter|requesty> [FLAGS] <INPUT>
   `@file.json` to read it from a file). Top-level keys override humanify's;
   `messages`, `system` and `stream` are rejected. This is the escape hatch for
   provider-specific parameters humanify has no flag for.
+* `--start-sentinel <TEXT>` / `--stop-sentinel <TEXT>` rename only one region of
+  the file. See [Renaming one region](#renaming-one-region-sentinels).
+* `--sentinel-strict`, `--sentinel-expand-helpers` pick a different selection
+  policy for that region.
+* `--dry-run` resolves the sentinels, prints the window and the identifiers it
+  selects, and exits without making a single LLM call.
 
 Run `humanify --help` for the full reference.
 
@@ -311,6 +317,111 @@ Default model: `nvidia/nemotron-3-super-120b-a12b`. Override with `-m`:
 ```shell
 humanify requesty obfuscated.js -m nvidia/nemotron-3-super-120b-a12b
 ```
+
+## Renaming one region (sentinels)
+
+Many times you don't want to pay to humanify a whole bundle, you want to
+only review one module/function. `--start-sentinel` and `--stop-sentinel` mark that region, and
+only the identifiers visible in it are sent to the model.
+
+**A sentinel is a literal fragment of the input file**, resolved by plain text
+search.Pick a distinctive-looking run of characters that only occurs once in the file for the sentinel:
+
+```shell
+humanify openai bundle.min.js -o bundle.js \
+  --start-sentinel 'or(var t=e.split(/\n+/g' \
+  --stop-sentinel  'return n.filter(Boolean)'
+```
+
+The window runs from the **start** of the start-match to the **end** of the
+stop-match, so both fragments are inside it. Either flag may be omitted (start of
+file / end of file respectively). The fragment is matched against the raw input
+bytes, so copy it from the input file itself. Because you are pointing at code that
+is already there, the input file is never edited and every existing cache entry
+stays valid.
+
+A fragment that matches **zero** times, or **more than once**, is a hard error
+(exit 64) — the multi-match message lists every occurrence as `line:col`.
+Silently picking the first match would spend real money on the wrong region, and
+since you can pre-verify uniqueness in your editor, a hard error costs you
+nothing. Stale markers from a previous session are caught the same way.
+
+### `@file` for awkward fragments
+
+Code fragments contain quotes, parens, backslashes and `$`, which are unpleasant
+to quote on a command line — especially in PowerShell, where backtick is the
+escape character and `$` interpolates. Both flags accept `@path` and read the
+fragment verbatim from a file (one trailing newline is trimmed, since editors add
+one):
+
+```shell
+humanify openai bundle.min.js --start-sentinel @start.txt --stop-sentinel @stop.txt
+```
+
+### Check before you buy: `--dry-run`
+
+`--dry-run` resolves the sentinels, applies the filter, prints the window and the
+selected identifiers to stderr, and exits **without constructing an LLM client or
+making a single call**. Nothing is written to `-o`.
+
+```
+$ humanify openai bundle.min.js --start-sentinel 'function target' --stop-sentinel 'return local; }' --dry-run
+humanify: dry run: no LLM calls made, no output written
+humanify: sentinel window: bytes 99..161 (lines 3..3), 3 of 6 identifiers selected
+humanify: selected identifiers: helperFn, local, target
+```
+
+A normal run prints the same `sentinel window:` line without `--verbose`, so a
+mis-aimed window is obvious in the first second rather than after the bill.
+
+### What gets renamed
+
+By default, an identifier is renamed if it is **declared in the window or
+referenced in the window** — everything visible in the region you are reading. So
+a helper declared hundreds of lines earlier but *called* inside the window is
+renamed, because the call site then reads `parseColorCodes(e)` instead of
+`xue(e)`. Its params and locals are **not**: you aren't going to read a
+third-party helper's body, and paying a model to name its loop counters is waste.
+
+| flag | what it selects |
+|---|---|
+| *(default)* | declaration **or** reference in the window |
+| `--sentinel-strict` | declaration in the window only |
+| `--sentinel-expand-helpers` | the default, plus the bodies of helpers pulled in by reference |
+
+`--sentinel-expand-helpers` can add quite a bit of cost as any method directly called from within
+the sentinel block also has all identifiers looked up.  This deliberately stops after one level
+following calls transitively would reach a bundler runtime quickly and end up back at the whole file.
+
+Things that are unaffected by any of this:
+
+* **Collisions.** Symbols outside the window still participate in collision
+  detection, so a new name inside the window is still suffixed if it would shadow
+  or capture an untouched name outside it.
+* **Prompts.** A symbol's context window is always derived from where it is
+  *declared*, no matter why it ended up in the work list. A helper pulled in by a
+  call site is still described to the model by the code around its own
+  declaration.
+* **Unrenamed symbols.** They simply print with their original names.
+
+
+### Mixing costs over one file
+
+The point of all this is a mixed-cost workflow. Because the cache key covers only
+the question (see [Caching](#caching)), a sentinel run and a later whole-file run
+share answers:
+
+```shell
+# Buy the region you care about with a good model
+humanify anthropic bundle.min.js --cache-dir .cache \
+  --start-sentinel 'function target' --stop-sentinel 'return local; }' -o partial.js
+
+# Sweep the rest cheaply; the region's names are reused, not re-bought
+humanify ollama bundle.min.js --cache-dir .cache -o bundle.js
+```
+
+Order does not matter — whichever run reaches an identifier first supplies its
+name. Use `--refresh-cache` to genuinely replace earlier answers (ie to do the more costly run after the main run).
 
 ## Caching
 
